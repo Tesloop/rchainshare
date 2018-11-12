@@ -1,0 +1,171 @@
+/*
+User registration and, for registered users, authentication protected access to nonforgeable
+read and write channel for their data.
+
+TODO Add nonce requirement
+*/
+
+
+new registerUser, getChannels, stdout(`rho:io:stdout`) in {
+
+    // Using "a6da46a1dc7ed715d4cd6472a736249a4d11142d160dbef9f20ae493de908c4e" as the claim for the moment
+    // just because we know the signature.  Swap out per use case
+    // once we have the code really done (integrated with testnet...).
+
+    new verifyClaimSignature, userChannels, readChannelFactory, writeChannelFactory in {
+
+        userChannels!({}) | //  Maps user public keys to their assigned channels
+
+        /*
+        *  Return true if the publicKey was used to sign the claim resulting in claimSignature.
+        */
+        contract verifyClaimSignature(claim, claimSignature, publicKey, ret) = {
+            @"ed25519Verify"!(
+                *claim.hexToBytes(),
+                *claimSignature.hexToBytes(),
+                *publicKey.hexToBytes(),
+                *ret
+            )
+        }
+
+        |
+
+        /*
+        *  Register a user if we can verify them.
+        *
+        *  Registration means associating the user with an unforgeable data channel.
+        */
+        contract registerUser(@signature, @publicKey, ret) = {
+            new ack in {
+                verifyClaimSignature!("a6da46a1dc7ed715d4cd6472a736249a4d11142d160dbef9f20ae493de908c4e", signature, publicKey, *ack) |
+                for (claimGood <- ack) {
+                    if (*claimGood) {
+                        new dataCh in {
+                            dataCh!(@"currentSeq"!(0)) | 
+                            for (@map <- userChannels) {
+                                ret!(true) |
+                                userChannels!(map.set(publicKey, *dataCh))
+                            }
+                        }
+                    } else {
+                        ret!(false)
+                    }
+                }
+            }
+        }
+
+        |
+
+        /*
+        * Return a read contract that will iterate once through data channel.
+        */
+        contract readChannelFactory(dataCh, read) = {
+            contract read(ret) = {
+                new nextSeq in {
+                    for (@{@"currentSeq"!(currentSeq)} <- dataCh) {
+                        nextSeq!(currentSeq+1) |
+                        for (@_nextSeq <- nextSeq) {
+                            dataCh!(@"currentSeq"!(_nextSeq)) |
+                            for (@{@"seq"!(=currentSeq) | @"payload"!(row)} <= dataCh) {
+                                ret!(row) |
+                                dataCh!(@"payload"!(row) | @"seq"!(_nextSeq))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        |
+
+        /*
+        * Return a write contract for writing to the data channel.
+        */
+        contract writeChannelFactory(dataCh, write) = {
+            contract write(@row, ack) = {
+                //  Write the new item using the current sequence number
+                for (@{@"currentSeq"!(currentSeq)} <- dataCh) {
+                    dataCh!(@"currentSeq"!(currentSeq)) |
+                    dataCh!(@"payload"!(row) | @"seq"!(currentSeq)) |
+                    ack!(true)
+                }
+            }
+        }
+
+        |
+
+        /*
+        *  Return dynamically created read and write channels for the user, if verified.
+        */
+        contract getChannels(@signature, @publicKey, ret) = {
+            new ack in {
+                verifyClaimSignature!("a6da46a1dc7ed715d4cd6472a736249a4d11142d160dbef9f20ae493de908c4e", signature, publicKey, *ack) |
+                for (claimGood <- ack) {
+                    if (*claimGood) {
+                        for (@{map /\ {{publicKey}: dataCh ..._}} <- userChannels) {
+                            new ack1, ack2, read, write in {
+                                readChannelFactory!(dataCh, *read) |
+                                writeChannelFactory!(dataCh, *write) |
+                                ret!(*read, *write, dataCh)
+                            } |
+                            userChannels!(map)
+                        }
+                    } else {
+                        ret!(false, false)
+                    }
+                }
+            }
+        }
+    }
+
+    |
+
+    // Tests
+    // These are very hokey until we hook up Python interface for proper harness.
+
+    //  Invalidly signed, registration should fail which we see by print false
+    new ack1, ack2, ack3, ack4, ret1, ret2, readChannel1, readChannel2, readChannel3 in {
+        registerUser!(
+            "d1a909078ce8b8706a641b07a0d4fe2108064813ce42009f108f89c2a3f4864aa1a510d6dfccad3b62cd610db0bfe82bcecb08d813997fa7df14972f56017e0b",
+            "288755c48c3951f89c5f0ffe885088dc0970fd935bc12adfdd81f81bb63d6219",
+            *ack1
+        ) |
+        for (@x <- ack1) {
+            stdout!(["false == ", x])
+        } |
+        //  Validly signed, registration should succeed which we see by print true
+        registerUser!(
+            "d0a909078ce8b8706a641b07a0d4fe2108064813ce42009f108f89c2a3f4864aa1a510d6dfccad3b62cd610db0bfe82bcecb08d813997fa7df14972f56017e0b",
+            "288755c48c3951f89c5f0ffe885088dc0970fd935bc12adfdd81f81bb63d6219",
+            *ack2
+        ) |
+        for (@x <- ack2) {
+            stdout!(["true == ", x]) |
+            //  Since valid, we should be able to back the channels
+            getChannels!(
+                "d0a909078ce8b8706a641b07a0d4fe2108064813ce42009f108f89c2a3f4864aa1a510d6dfccad3b62cd610db0bfe82bcecb08d813997fa7df14972f56017e0b",
+                "288755c48c3951f89c5f0ffe885088dc0970fd935bc12adfdd81f81bb63d6219",
+                *ret1
+            ) |
+            for (read, write, data <- ret1) {
+                //  The channels work for reading and writing
+                write!("ok", *ack3) |
+                for (_ <- ack3) {
+                    read!(*readChannel1) | read!(*readChannel2) |
+                    //  Can read multiple times without exhausting data
+                    for (@r1 <= readChannel1; @r2 <= readChannel2) {
+                        stdout!(["[ok,ok] == ", [r1, r2]]) |
+                        //  And if multiple data items written, can read them all.
+                        write!("second_ok", *ack4) |
+                        for (_ <- ack4) {
+                            read!(*readChannel3)|
+                            for (@r3 <= readChannel3) {
+                                stdout!(["[ok or second_ok] == ", r3])
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

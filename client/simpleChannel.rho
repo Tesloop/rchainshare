@@ -1,0 +1,24 @@
+/*
+Create a channel for read/write, returning its registry address the registryResult channel.
+
+Channel is totally unprotected - anyone with address can do anything on it.
+Only suitable on testnet for meeting our "write" milestone.
+
+Any code wanting to use the channel can use the key to look it up in the registry.
+
+Run this manually against the target chain once to create the channel, and get the
+resulting registry address from the output.
+*/
+
+
+new ack, register(`rho:registry:insertArbitrary`) in {
+
+  new tesloopDemoChannel in {
+
+    register!({*tesloopDemoChannel}, *ack) |
+
+    for (@msg <- ack) {
+        registryResult!(["From registry: ", msg])
+    }
+  }
+}
